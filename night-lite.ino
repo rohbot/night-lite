@@ -1,6 +1,8 @@
 #include <FastLED.h>
 #include <Wire.h>
 #include <Adafruit_BME280.h>
+#include <WiFi.h>
+#include <esp_now.h>
 
 // ---------- LED config ----------
 #define LED_PIN 7
@@ -9,92 +11,116 @@
 #define COLOR_ORDER RGB
 
 CRGB leds[NUM_LEDS];
-
-bool ledState = true;         // LED starts ON
-bool lastButtonState = HIGH;  // because of pullup
+bool ledState = true;
 unsigned long lastDebounceTime = 0;
 unsigned long lastPrint = 0;
 
 // ---------- Button config ----------
 #define BUTTON_PIN 9
-#define DEBOUNCE_MS 500  // debounce time in ms
-#define PRINT_MS 2000    // print time
+#define DEBOUNCE_MS 500
+#define PRINT_MS 2000
+
 // ---------- BME280 config ----------
 #define SDA_PIN 5
 #define SCL_PIN 6
-
 #define COLOUR CRGB(255, 120, 0)
 
 Adafruit_BME280 bme;
 bool bme_ok = false;
 
-void setup() {
-  // Serial
-  Serial.begin(115200);
-  delay(1000);
-  Serial.println("ESP32-S3 Zero: WS2812 + Button + BME280");
+// ---------- ESP-NOW broadcast ----------
+static const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+static const uint8_t ESPNOW_CHANNEL = 1;
 
-  // LED
+// Our packet: temperature only
+typedef struct {
+  float temperatureC;
+} SensorPacket;
+
+// NEW callback signature for Arduino-ESP32 v3.x (IDF 5.x)
+void onEspNowSent(const wifi_tx_info_t* info, esp_now_send_status_t status) {
+  Serial.print("ESP-NOW send status: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "SUCCESS" : "FAIL");
+}
+
+bool initEspNow() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);
+  delay(100);
+  WiFi.setChannel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed!");
+    return false;
+  }
+  esp_now_register_send_cb(onEspNowSent);
+
+  // Add broadcast peer
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, BROADCAST_MAC, 6);
+  peerInfo.channel = ESPNOW_CHANNEL;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add broadcast peer!");
+    return false;
+  }
+
+  Serial.print("ESP-NOW ready. My MAC: ");
+  Serial.println(WiFi.macAddress());
+  return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("ESP32-S3 Sender: broadcast temperature over ESP-NOW");
+
   FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
   FastLED.setBrightness(80);
-  leds[0] = COLOUR;  // start ON
+  leds[0] = COLOUR;
   FastLED.show();
 
-  // Button with internal pullup
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-
-  // I2C init with custom pins
   Wire.begin(SDA_PIN, SCL_PIN);
 
-  // BME280 init at 0x77
   if (bme.begin(0x77, &Wire)) {
     Serial.println("BME280 detected at 0x77!");
     bme_ok = true;
   } else {
-    Serial.println("Could not find BME280 sensor at 0x77!");
+    Serial.println("Could not find BME280!");
   }
+
+  initEspNow();
   lastDebounceTime = millis();
 }
 
 void loop() {
-  // ---- Button debounce + LED toggle ----
+  // Button debounce + LED toggle
   int reading = digitalRead(BUTTON_PIN);
-
-  // Serial.println("here");
-  if (reading == LOW) {
-    
-    if ((millis() - lastDebounceTime) > DEBOUNCE_MS) {
-      // Button pressed
-      Serial.println("Button pressed!");
-
-      ledState = !ledState;  // toggle LED state
-      if (ledState) {
-        leds[0] = COLOUR;
-      } else {
-        leds[0] = CRGB::Black;
-      }
-      FastLED.show();
-      lastDebounceTime = millis();
-    }
+  if (reading == LOW && (millis() - lastDebounceTime) > DEBOUNCE_MS) {
+    ledState = !ledState;
+    leds[0] = ledState ? COLOUR : CRGB::Black;
+    FastLED.show();
+    lastDebounceTime = millis();
   }
 
-
-
-
+  // Send temp every PRINT_MS
   if ((millis() - lastPrint) > PRINT_MS) {
-    // ---- BME280 readings ----
+    float temperature = NAN;
     if (bme_ok) {
-      float temperature = bme.readTemperature();  // °C
-      float humidity = bme.readHumidity();        // %
-
-      Serial.print("Temp: ");
-      Serial.print(temperature);
-      Serial.print(" °C  |  Humidity: ");
-      Serial.print(humidity);
-      Serial.print(" % | Reading: ");
-      Serial.println(reading);
-      Serial.println(lastButtonState);
-      lastPrint = millis();
+      temperature = bme.readTemperature();
     }
+    SensorPacket pkt;
+    pkt.temperatureC = temperature;
+
+    esp_err_t res = esp_now_send(BROADCAST_MAC, (uint8_t*)&pkt, sizeof(pkt));
+
+    Serial.print("Broadcast Temp: ");
+    Serial.print(temperature);
+    Serial.print(" °C | Result: ");
+    Serial.println(res == ESP_OK ? "OK" : String("ERR ") + res);
+
+    lastPrint = millis();
   }
 }
